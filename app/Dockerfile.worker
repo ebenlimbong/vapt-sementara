@@ -1,0 +1,29 @@
+FROM node:20-alpine AS base
+WORKDIR /app
+RUN apk add --no-cache openssl curl ca-certificates unzip
+
+# httpx & nuclei (ProjectDiscovery) — binary Go resmi, statis, cocok untuk Alpine.
+# Kalau rilis gagal diunduh (mis. build tanpa akses internet), worker tetap berjalan
+# dan stage fingerprint_tech/kerentanan_nuclei otomatis dilewati (lihat worker/realtools.ts).
+ARG HTTPX_VERSION=1.6.9
+ARG NUCLEI_VERSION=3.3.7
+RUN set -eux; \
+    ARCH=$(uname -m); \
+    case "$ARCH" in x86_64) PD_ARCH=amd64 ;; aarch64) PD_ARCH=arm64 ;; *) PD_ARCH=amd64 ;; esac; \
+    curl -fsSL -o /tmp/httpx.zip "https://github.com/projectdiscovery/httpx/releases/download/v${HTTPX_VERSION}/httpx_${HTTPX_VERSION}_linux_${PD_ARCH}.zip" || true; \
+    curl -fsSL -o /tmp/nuclei.zip "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_${PD_ARCH}.zip" || true; \
+    if [ -s /tmp/httpx.zip ]; then unzip -o /tmp/httpx.zip -d /usr/local/bin httpx && chmod +x /usr/local/bin/httpx; fi; \
+    if [ -s /tmp/nuclei.zip ]; then unzip -o /tmp/nuclei.zip -d /usr/local/bin nuclei && chmod +x /usr/local/bin/nuclei; fi; \
+    rm -f /tmp/httpx.zip /tmp/nuclei.zip
+
+RUN (nuclei -update-templates -silent || true)
+
+FROM base AS deps
+COPY package.json package-lock.json* ./
+RUN npm ci --no-audit --no-fund
+
+FROM deps AS runner
+ENV NODE_ENV=production
+COPY . .
+RUN npx prisma generate
+CMD ["npx", "tsx", "worker/index.ts"]

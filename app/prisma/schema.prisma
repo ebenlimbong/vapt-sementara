@@ -1,0 +1,462 @@
+// VAPT Platform — Prisma schema
+// Sesuai PRD vapt-upa-tik-itera §6 Database Schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Model peran disederhanakan jadi 2 peran GLOBAL per user (bukan per-aplikasi lagi):
+//  - admin: kelola user/aplikasi/vault kredensial, menyetujui/menolak ruang lingkup,
+//    melihat jejak audit. Tidak menjalankan scan/triage/retest sendiri.
+//  - pentester: ajukan permintaan uji, susun ruang lingkup, jalankan scan, triage
+//    kandidat, beri CVSS, catat progres remediasi, retest, buat laporan.
+// Pemisahan tugas: pentester TIDAK PERNAH bisa menyetujui ruang lingkup (hanya admin
+// yang punya endpoint approval) — jadi "self-approve" otomatis mustahil terjadi.
+enum Role {
+  admin
+  pentester
+}
+
+enum AppCategory {
+  web
+  api
+}
+
+enum AppEnvironment {
+  staging
+  lab
+}
+
+enum UserStatus {
+  active
+  inactive
+}
+
+enum RequestStatus {
+  diajukan
+  disetujui
+  berjalan
+  selesai
+  ditolak
+}
+
+enum ApprovalDecision {
+  approved
+  rejected
+}
+
+enum JobType {
+  web_scan
+  api_access_test
+  retest
+}
+
+enum JobStatus {
+  queued
+  running
+  done
+  failed
+  cancelled
+}
+
+enum CandidateStatus {
+  baru
+  terverifikasi_jadi_temuan
+  alarm_palsu
+}
+
+enum Severity {
+  critical
+  high
+  medium
+  low
+  info
+}
+
+enum FindingStatus {
+  baru
+  dikerjakan
+  menunggu_retest
+  selesai
+}
+
+enum RetestResult {
+  tertutup
+  masih_terbuka
+}
+
+enum ReportType {
+  technical
+  executive
+}
+
+enum AccessExpectation {
+  allow
+  deny
+}
+
+enum AccessVerdict {
+  sesuai
+  menyimpang
+}
+
+model User {
+  id           String   @id @default(uuid())
+  name         String
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  mfaSecret    String?  @map("mfa_secret")
+  mfaEnabled   Boolean  @default(false) @map("mfa_enabled")
+  role         Role     @default(pentester)
+  status       UserStatus @default(active)
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  testRequests      TestRequest[]      @relation("RequestedBy")
+  scopeVersions     ScopeVersion[]     @relation("ScopeCreatedBy")
+  scopeApprovals    ScopeApproval[]    @relation("Approver")
+  scanJobs          ScanJob[]          @relation("ScanCreatedBy")
+  apiSpecs          ApiSpec[]          @relation("ImportedBy")
+  findingsCreated   Finding[]          @relation("FindingCreatedBy")
+  evidenceUploaded  Evidence[]         @relation("EvidenceUploadedBy")
+  remediationActs   RemediationEvent[] @relation("RemediationActor")
+  retestsVerified   Retest[]           @relation("RetestVerifiedBy")
+  credentialsAdded  CredentialVaultEntry[] @relation("CredentialCreatedBy")
+  reportsGenerated  Report[]           @relation("ReportGeneratedBy")
+  auditLogs         AuditLog[]         @relation("AuditActor")
+
+  @@map("users")
+}
+
+model Application {
+  id          String          @id @default(uuid())
+  name        String
+  baseUrl     String          @map("base_url")
+  category    AppCategory
+  environment AppEnvironment
+  rating      String?
+  createdAt   DateTime        @default(now()) @map("created_at")
+
+  testRequests  TestRequest[]
+  apiSpecs      ApiSpec[]
+  testAccounts  TestAccount[]
+  findings      Finding[]
+  credentials   CredentialVaultEntry[]
+  reports       Report[]
+
+  @@map("applications")
+}
+
+model TestRequest {
+  id           String        @id @default(uuid())
+  appId        String        @map("app_id")
+  app          Application   @relation(fields: [appId], references: [id], onDelete: Cascade)
+  requestedBy  String        @map("requested_by")
+  requester    User          @relation("RequestedBy", fields: [requestedBy], references: [id])
+  purpose      String
+  targetUrl    String        @map("target_url")
+  desiredStart DateTime      @map("desired_start")
+  desiredEnd   DateTime      @map("desired_end")
+  status       RequestStatus @default(diajukan)
+  createdAt    DateTime      @default(now()) @map("created_at")
+
+  scopeVersions ScopeVersion[]
+  testWindows   TestWindow[]
+  scanJobs      ScanJob[]
+  reports       Report[]
+
+  @@map("test_requests")
+}
+
+model ScopeVersion {
+  id          String   @id @default(uuid())
+  requestId   String   @map("request_id")
+  request     TestRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  versionNo   Int      @map("version_no")
+  content     Json
+  diffSummary Json?    @map("diff_summary")
+  isFinal     Boolean  @default(false) @map("is_final")
+  createdBy   String   @map("created_by")
+  creator     User     @relation("ScopeCreatedBy", fields: [createdBy], references: [id])
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  approvals ScopeApproval[]
+  scanJobs  ScanJob[]
+  testWindows TestWindow[] @relation("ApprovedScope")
+
+  @@unique([requestId, versionNo])
+  @@map("scope_versions")
+}
+
+model ScopeApproval {
+  id             String   @id @default(uuid())
+  scopeVersionId String   @map("scope_version_id")
+  scopeVersion   ScopeVersion @relation(fields: [scopeVersionId], references: [id], onDelete: Cascade)
+  approverId     String   @map("approver_id")
+  approver       User     @relation("Approver", fields: [approverId], references: [id])
+  decision       ApprovalDecision
+  reason         String?
+  decidedAt      DateTime @default(now()) @map("decided_at")
+
+  testWindow TestWindow?
+
+  @@map("scope_approvals")
+}
+
+model TestWindow {
+  id              String   @id @default(uuid())
+  requestId       String   @map("request_id")
+  request         TestRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  approvedScopeId String   @unique @map("approved_scope_id")
+  approvedScope   ScopeApproval @relation(fields: [approvedScopeId], references: [id])
+  scopeVersionId  String?  @map("scope_version_id")
+  scopeVersion    ScopeVersion? @relation("ApprovedScope", fields: [scopeVersionId], references: [id])
+  startAt         DateTime @map("start_at")
+  endAt           DateTime @map("end_at")
+  isActive        Boolean  @default(true) @map("is_active")
+
+  @@map("test_windows")
+}
+
+model ScanJob {
+  id               String    @id @default(uuid())
+  requestId        String    @map("request_id")
+  request          TestRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  scopeVersionId   String    @map("scope_version_id")
+  scopeVersion     ScopeVersion @relation(fields: [scopeVersionId], references: [id])
+  jobType          JobType   @map("job_type")
+  status           JobStatus @default(queued)
+  currentStage     String?   @map("current_stage")
+  progressPct      Int       @default(0) @map("progress_pct")
+  cancelRequested  Boolean   @default(false) @map("cancel_requested")
+  failureReason    String?   @map("failure_reason")
+  createdBy        String    @map("created_by")
+  creator          User      @relation("ScanCreatedBy", fields: [createdBy], references: [id])
+  queuedAt         DateTime  @default(now()) @map("queued_at")
+  startedAt        DateTime? @map("started_at")
+  finishedAt       DateTime? @map("finished_at")
+
+  events      ScanJobEvent[]
+  candidates  Candidate[]
+  accessScenarios AccessScenario[]
+  retests     Retest[]
+
+  @@map("scan_jobs")
+}
+
+model ScanJobEvent {
+  id        BigInt   @id @default(autoincrement())
+  jobId     String   @map("job_id")
+  job       ScanJob  @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  stage     String
+  status    String
+  message   String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("scan_job_events")
+}
+
+model ApiSpec {
+  id            String   @id @default(uuid())
+  appId         String   @map("app_id")
+  app           Application @relation(fields: [appId], references: [id], onDelete: Cascade)
+  fileName      String   @map("file_name")
+  checksum      String
+  rejectedRefs  Json?    @map("rejected_refs")
+  importedBy    String   @map("imported_by")
+  importer      User     @relation("ImportedBy", fields: [importedBy], references: [id])
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  endpoints ApiEndpoint[]
+
+  @@map("api_specs")
+}
+
+model ApiEndpoint {
+  id       String  @id @default(uuid())
+  specId   String  @map("spec_id")
+  spec     ApiSpec @relation(fields: [specId], references: [id], onDelete: Cascade)
+  method   String
+  path     String
+  params   Json?
+  inScope  Boolean @default(true) @map("in_scope")
+
+  accessScenarios AccessScenario[]
+  candidates      Candidate[]
+
+  @@map("api_endpoints")
+}
+
+model TestAccount {
+  id            String   @id @default(uuid())
+  appId         String   @map("app_id")
+  app           Application @relation(fields: [appId], references: [id], onDelete: Cascade)
+  roleLabel     String   @map("role_label")
+  credentialRef String   @unique @map("credential_ref")
+  credential    CredentialVaultEntry @relation(fields: [credentialRef], references: [id])
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  accessScenarios AccessScenario[]
+
+  @@map("test_accounts")
+}
+
+model AccessScenario {
+  id         String   @id @default(uuid())
+  endpointId String   @map("endpoint_id")
+  endpoint   ApiEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+  actorAccountId String? @map("actor_account_id")
+  actorAccount   TestAccount? @relation(fields: [actorAccountId], references: [id])
+  actorRole  String   @map("actor_role")
+  expected   AccessExpectation
+  actual     String?
+  verdict    AccessVerdict?
+  jobId      String?  @map("job_id")
+  job        ScanJob? @relation(fields: [jobId], references: [id])
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@map("access_scenarios")
+}
+
+model Candidate {
+  id            String   @id @default(uuid())
+  jobId         String   @map("job_id")
+  job           ScanJob  @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  endpointId    String?  @map("endpoint_id")
+  endpoint      ApiEndpoint? @relation(fields: [endpointId], references: [id])
+  title         String
+  category      String
+  normalizedKey String   @map("normalized_key")
+  rawPayload    Json?    @map("raw_payload")
+  status        CandidateStatus @default(baru)
+  dismissReason String?  @map("dismiss_reason")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  finding Finding?
+
+  @@map("candidates")
+}
+
+model Finding {
+  id            String   @id @default(uuid())
+  appId         String   @map("app_id")
+  app           Application @relation(fields: [appId], references: [id], onDelete: Cascade)
+  candidateId   String?  @unique @map("candidate_id")
+  candidate     Candidate? @relation(fields: [candidateId], references: [id])
+  title         String
+  description   String
+  steps         String?
+  impact        String?
+  severity      Severity
+  cvssVector    String?  @map("cvss_vector")
+  cvssScore     Float?   @map("cvss_score")
+  status        FindingStatus @default(baru)
+  ownerResponse String?  @map("owner_response")
+  dueDate       DateTime? @map("due_date")
+  createdBy     String   @map("created_by")
+  creator       User     @relation("FindingCreatedBy", fields: [createdBy], references: [id])
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  evidence           Evidence[]
+  remediationEvents  RemediationEvent[]
+  retests            Retest[]
+
+  @@map("findings")
+}
+
+model Evidence {
+  id         String   @id @default(uuid())
+  findingId  String   @map("finding_id")
+  finding    Finding  @relation(fields: [findingId], references: [id], onDelete: Cascade)
+  versionNo  Int      @map("version_no")
+  filePath   String   @map("file_path")
+  sha256     String
+  mimeType   String   @map("mime_type")
+  uploadedBy String   @map("uploaded_by")
+  uploader   User     @relation("EvidenceUploadedBy", fields: [uploadedBy], references: [id])
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@unique([findingId, versionNo])
+  @@map("evidence")
+}
+
+model RemediationEvent {
+  id         BigInt   @id @default(autoincrement())
+  findingId  String   @map("finding_id")
+  finding    Finding  @relation(fields: [findingId], references: [id], onDelete: Cascade)
+  fromStatus String?  @map("from_status")
+  toStatus   String   @map("to_status")
+  note       String?
+  actorId    String   @map("actor_id")
+  actor      User     @relation("RemediationActor", fields: [actorId], references: [id])
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@map("remediation_events")
+}
+
+model Retest {
+  id         String   @id @default(uuid())
+  findingId  String   @map("finding_id")
+  finding    Finding  @relation(fields: [findingId], references: [id], onDelete: Cascade)
+  jobId      String?  @map("job_id")
+  job        ScanJob? @relation(fields: [jobId], references: [id])
+  result     RetestResult
+  note       String?
+  verifiedBy String   @map("verified_by")
+  verifier   User     @relation("RetestVerifiedBy", fields: [verifiedBy], references: [id])
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@map("retests")
+}
+
+model CredentialVaultEntry {
+  id             String   @id @default(uuid())
+  appId          String   @map("app_id")
+  app            Application @relation(fields: [appId], references: [id], onDelete: Cascade)
+  label          String
+  encryptedValue String   @map("encrypted_value")
+  createdBy      String   @map("created_by")
+  creator        User     @relation("CredentialCreatedBy", fields: [createdBy], references: [id])
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  testAccount TestAccount?
+
+  @@map("credential_vault")
+}
+
+model Report {
+  id          String     @id @default(uuid())
+  requestId   String?    @map("request_id")
+  request     TestRequest? @relation(fields: [requestId], references: [id])
+  appId       String     @map("app_id")
+  app         Application @relation(fields: [appId], references: [id], onDelete: Cascade)
+  reportType  ReportType @map("report_type")
+  filePath    String     @map("file_path")
+  sha256      String
+  generatedBy String     @map("generated_by")
+  generator   User       @relation("ReportGeneratedBy", fields: [generatedBy], references: [id])
+  createdAt   DateTime   @default(now()) @map("created_at")
+
+  @@map("reports")
+}
+
+model AuditLog {
+  id         BigInt   @id @default(autoincrement())
+  actorId    String?  @map("actor_id")
+  actor      User?    @relation("AuditActor", fields: [actorId], references: [id])
+  action     String
+  entityType String?  @map("entity_type")
+  entityId   String?  @map("entity_id")
+  metadata   Json?
+  ipAddress  String?  @map("ip_address")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@map("audit_logs")
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@index([action])
+}

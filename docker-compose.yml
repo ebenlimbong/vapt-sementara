@@ -1,0 +1,99 @@
+version: "3.9"
+
+# Platform VAPT — UPA TIK ITERA
+# Jaringan internal terisolasi: app & worker bisa menjangkau target lab,
+# tapi target lab TIDAK bisa menjangkau internet luar (anti-SSRF layer tambahan).
+
+networks:
+  vapt-net:
+    driver: bridge
+  lab-net:
+    driver: bridge
+    internal: false   # target lab butuh pull image publik saat build; traffic keluar dibatasi di app layer (allowlist base_url)
+
+volumes:
+  pgdata:
+  evidence-data:
+  reports-data:
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-vapt}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vapt_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-vapt}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks: [vapt-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vapt}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-vapt}:${POSTGRES_PASSWORD:-vapt_dev_password}@db:5432/${POSTGRES_DB:-vapt}
+      AUTH_SECRET: ${AUTH_SECRET:-change_me_dev_secret_please}
+      VAULT_KEY: ${VAULT_KEY:-change_me_32_byte_minimum_dev_key}
+      NODE_ENV: production
+      EVIDENCE_DIR: /data/evidence
+      REPORTS_DIR: /data/reports
+      ALLOWED_SCAN_HOSTS: ${ALLOWED_SCAN_HOSTS:-juice-shop,dvwa,vampi,crapi-api,demo.owasp-juice.shop}
+    volumes:
+      - evidence-data:/data/evidence
+      - reports-data:/data/reports
+    ports:
+      - "3000:3000"
+    networks: [vapt-net, lab-net]
+
+  worker:
+    build:
+      context: ./app
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-vapt}:${POSTGRES_PASSWORD:-vapt_dev_password}@db:5432/${POSTGRES_DB:-vapt}
+      VAULT_KEY: ${VAULT_KEY:-change_me_32_byte_minimum_dev_key}
+      EVIDENCE_DIR: /data/evidence
+      ALLOWED_SCAN_HOSTS: ${ALLOWED_SCAN_HOSTS:-juice-shop,dvwa,vampi,crapi-api,demo.owasp-juice.shop}
+    volumes:
+      - evidence-data:/data/evidence
+    networks: [vapt-net, lab-net]
+
+  # ---- Target lab (sengaja vulnerable, HANYA untuk staging/lab internal) ----
+  juice-shop:
+    image: bkimminich/juice-shop:latest
+    restart: unless-stopped
+    networks: [lab-net]
+
+  dvwa:
+    image: vulnerables/web-dvwa:latest
+    restart: unless-stopped
+    networks: [lab-net]
+
+  vampi:
+    image: erev0s/vampi:latest
+    restart: unless-stopped
+    environment:
+      VULNERABLE: "1"
+    networks: [lab-net]
+
+  crapi-api:
+    image: crapi/crapi-identity:latest
+    restart: unless-stopped
+    networks: [lab-net]
